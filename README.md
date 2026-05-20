@@ -1,14 +1,32 @@
 # httpql
 
-A safe, configurable HTTP engine for Go. Use it to execute outbound HTTP requests — GET or POST — with automatic rate limiting, timeouts, caching, SSRF protection, and audit logging all on by default.
+[![CI](https://github.com/yesoreyeram/httpql/actions/workflows/ci.yml/badge.svg)](https://github.com/yesoreyeram/httpql/actions/workflows/ci.yml)
+[![Security](https://github.com/yesoreyeram/httpql/actions/workflows/security.yml/badge.svg)](https://github.com/yesoreyeram/httpql/actions/workflows/security.yml)
+
+A safe, configurable HTTP engine for Go with its own query language. Use it to
+execute outbound HTTP requests from the command line or embed the engine in your
+Go application — rate limiting, timeouts, caching, SSRF protection, and audit
+logging are all on by default.
 
 ---
 
 ## Table of contents
 
 - [Installation](#installation)
-- [Quick start](#quick-start)
-- [Making requests](#making-requests)
+- [Command-line usage](#command-line-usage)
+  - [Run a query inline](#run-a-query-inline)
+  - [Run a query from a file](#run-a-query-from-a-file)
+  - [CLI flags](#cli-flags)
+- [Query language](#query-language)
+  - [Simple request](#simple-request)
+  - [Request headers](#request-headers)
+  - [Request body types](#request-body-types)
+  - [Multiple datasources — WITH](#multiple-datasources--with)
+  - [Query hints](#query-hints)
+  - [Comments](#comments)
+  - [Full example](#full-example)
+- [Quick start (Go API)](#quick-start-go-api)
+- [Making requests (Go API)](#making-requests-go-api)
   - [GET request](#get-request)
   - [POST — JSON body](#post--json-body)
   - [POST — URL-encoded form](#post--url-encoded-form)
@@ -27,6 +45,7 @@ A safe, configurable HTTP engine for Go. Use it to execute outbound HTTP request
 - [Admin API](#admin-api)
 - [Default limits](#default-limits)
 - [Security guarantees](#security-guarantees)
+- [CI / CD](#ci--cd)
 
 ---
 
@@ -34,20 +53,264 @@ A safe, configurable HTTP engine for Go. Use it to execute outbound HTTP request
 
 **Requires Go 1.25+**
 
+Install the `httpql` CLI:
+
+```sh
+go install github.com/yesoreyeram/httpql/cmd/httpql@latest
+```
+
+Add the library to a Go module:
+
 ```sh
 go get github.com/yesoreyeram/httpql
 ```
 
-To build and run the standalone server:
+Build the binary from source:
 
 ```sh
-go build ./cmd/httpql
-./httpql
+git clone https://github.com/yesoreyeram/httpql
+cd httpql
+go build -o httpql ./cmd/httpql
+./httpql version
 ```
 
 ---
 
-## Quick start
+## Command-line usage
+
+### Run a query inline
+
+```sh
+httpql run 'GET https://api.example.com/users'
+```
+
+```sh
+httpql run 'POST https://api.example.com/items BODY JSON {"name":"widget","qty":5}'
+```
+
+### Run a query from a file
+
+Save your query in a `.httpql` file and pass the path:
+
+```sh
+httpql run query.httpql
+```
+
+### CLI flags
+
+```
+httpql run [flags] <query | file>
+
+Flags:
+  -n, --namespace string   Namespace to execute in  (default "default")
+  -o, --output   string    Output format: json or text  (default "json")
+      --config   string    Path to httpql-engine.yaml
+                           (also read from HTTPQL_CONFIG env var)
+```
+
+**Output formats**
+
+| `--output` | Description |
+|------------|-------------|
+| `json` (default) | JSON object with `status`, `headers`, `body`, `from_cache` |
+| `text` | Human-readable: status line, headers, blank line, body |
+
+**Examples**
+
+```sh
+# Pretty text output
+httpql run --output text 'GET https://httpbin.org/get'
+
+# Use a named namespace with a specific config file
+httpql run --namespace analytics-team --config /etc/httpql/config.yaml query.httpql
+
+# Start the admin server on port 9091 (default when no sub-command)
+httpql
+```
+
+---
+
+## Query language
+
+An httpql query is a plain-text file (or string) that describes one or more HTTP
+requests, plus optional hints that tune caching, concurrency, retries, and
+pagination. Keywords are case-insensitive. Line comments start with `--`.
+
+### Simple request
+
+```
+METHOD URL
+```
+
+`METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
+
+```
+GET  https://api.example.com/users
+POST https://api.example.com/items
+```
+
+### Request headers
+
+Append `HEADERS` followed by a JSON object:
+
+```
+GET https://api.example.com/users
+HEADERS {"Accept": "application/json", "Authorization": "Bearer token123"}
+```
+
+Multi-line JSON is fine:
+
+```
+GET https://api.example.com/users
+HEADERS {
+  "Accept":        "application/json",
+  "Authorization": "Bearer token123"
+}
+```
+
+### Request body types
+
+Add a `BODY` clause after the URL (and after `HEADERS` if present):
+
+| Type | Syntax | Content-Type set automatically |
+|------|--------|-------------------------------|
+| JSON | `BODY JSON { … }` or `BODY JSON [ … ]` | `application/json` |
+| URL-encoded form | `BODY FORM key=val&key2=val2` | `application/x-www-form-urlencoded` |
+| Plain text | `BODY TEXT some text here` | `text/plain; charset=utf-8` |
+| Raw bytes | `BODY RAW <string data>` | `application/octet-stream` |
+| GraphQL | `BODY GRAPHQL {"query":"…","variables":{…}}` | `application/json` |
+
+> **Tip:** Add `HEADERS {"Content-Type": "application/json; version=2"}` to
+> override the auto-set `Content-Type`.
+
+**JSON body**
+
+```
+POST https://api.example.com/items
+HEADERS {"Content-Type": "application/json"}
+BODY JSON {"name": "widget", "qty": 5}
+```
+
+**URL-encoded form body**
+
+```
+POST https://example.com/login
+BODY FORM username=alice&password=s3cr3t
+```
+
+**Plain text body**
+
+```
+POST https://example.com/log
+BODY TEXT event=login user=alice
+```
+
+**GraphQL body**
+
+```
+POST https://api.example.com/graphql
+BODY GRAPHQL {
+  "query": "query GetUser($id: ID!) { user(id: $id) { name email } }",
+  "variables": {"id": "42"}
+}
+```
+
+For multi-operation documents, add `"operationName"`:
+
+```
+POST https://api.example.com/graphql
+BODY GRAPHQL {
+  "query": "query A { a } query B { b }",
+  "operationName": "B"
+}
+```
+
+### Multiple datasources — WITH
+
+Fetch several endpoints in a single query using a `WITH` block:
+
+```
+WITH
+  users  AS (GET https://api.example.com/users),
+  orders AS (GET https://api.example.com/orders HEADERS {"Accept": "application/json"})
+CONCURRENCY 2
+```
+
+Each datasource gets a name (the alias after `AS`).  When run with
+`--output json`, the response is a JSON object keyed by those names:
+
+```json
+{
+  "users":  { "status": 200, "body": [ … ] },
+  "orders": { "status": 200, "body": [ … ] }
+}
+```
+
+The parentheses around each request are optional when the datasource block
+contains only a method and URL:
+
+```
+WITH
+  a AS GET https://api.example.com/a,
+  b AS GET https://api.example.com/b
+```
+
+### Query hints
+
+Hints follow the main request or `WITH` block.  They tune the engine's guard
+rail policy for this query only — the active policy caps all values at its
+configured maximum, so a hint can never exceed the admin-configured limit.
+
+| Hint | Description | Example |
+|------|-------------|---------|
+| `CONCURRENCY N` | Max number of parallel sub-requests | `CONCURRENCY 3` |
+| `QUERY_TIMEOUT N` | Wall-clock timeout in seconds | `QUERY_TIMEOUT 30` |
+| `REQUEST_CACHE N` | Cache responses for N seconds | `REQUEST_CACHE 300` |
+| `CACHE N` | Enable response cache with TTL of N seconds | `CACHE 60` |
+| `RETRY N` | Retry each failed request up to N times | `RETRY 2` |
+| `REDIRECTS FOLLOW MAX N` | Maximum redirect hops | `REDIRECTS FOLLOW MAX 5` |
+| `STOP_WHEN TOTAL_ITEMS >= N` | Stop pagination when row count reaches N | `STOP_WHEN TOTAL_ITEMS >= 1000` |
+| `STOP_WHEN PAGE_COUNT >= N` | Stop pagination after N pages | `STOP_WHEN PAGE_COUNT >= 50` |
+
+### Comments
+
+Lines starting with `--` and inline `--` suffixes are ignored:
+
+```
+-- Fetch the user list
+GET https://api.example.com/users  -- production API
+CACHE 60
+```
+
+### Full example
+
+```
+-- Fetch users and orders concurrently, cache results for 5 minutes.
+WITH
+  users AS (
+    GET https://api.example.com/users
+    HEADERS {"Accept": "application/json", "Authorization": "Bearer $TOKEN"}
+  ),
+  orders AS (
+    GET https://api.example.com/orders
+    HEADERS {"Accept": "application/json"}
+  )
+CONCURRENCY 2
+REQUEST_CACHE 300
+QUERY_TIMEOUT 60
+RETRY 2
+STOP_WHEN TOTAL_ITEMS >= 5000
+```
+
+Save as `fetch.httpql` and run:
+
+```sh
+httpql run --namespace analytics-team --output json fetch.httpql
+```
+
+---
+
+## Quick start (Go API)
 
 ```go
 package main
@@ -86,7 +349,7 @@ func main() {
 
 ---
 
-## Making requests
+## Making requests (Go API)
 
 Every request is described by an `engine.Request` value and executed through
 `engine.ExecuteRequest`. The engine enforces timeouts, body-size limits, SSRF
@@ -472,3 +735,27 @@ configuration file or environment variable:
 | Namespace cache isolation | Always enforced |
 | TLS certificate verification *(production)* | Always on |
 | Plain HTTP scheme *(production)* | Always blocked |
+
+---
+
+## CI / CD
+
+Three GitHub Actions workflows run on every push and pull request:
+
+| Workflow | File | Trigger | What it does |
+|----------|------|---------|--------------|
+| **CI** | `.github/workflows/ci.yml` | push / PR | `go vet`, `go build ./...`, `go test ./... -race` |
+| **Security** | `.github/workflows/security.yml` | push / PR / weekly | `govulncheck` (known CVEs), `shadow` (variable shadowing) |
+| **Release** | `.github/workflows/release.yml` | tag `v*.*.*` | Cross-compiles binaries for Linux, macOS, and Windows (amd64 + arm64), then creates a GitHub release and uploads the assets |
+
+**Creating a release**
+
+Push a semver tag; the release workflow handles the rest:
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The resulting release will include pre-built binaries for all five platforms, each named
+`httpql-v1.2.3-<os>-<arch>[.exe]`.
