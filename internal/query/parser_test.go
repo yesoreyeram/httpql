@@ -498,3 +498,80 @@ func TestScannerComment(t *testing.T) {
 		t.Fatalf("want GET word token, got kind=%d val=%q", tok.kind, tok.val)
 	}
 }
+
+// ─── secret / env-ref / chain ref counting ────────────────────────────────────
+
+func TestSecretRefsInURL(t *testing.T) {
+pq := mustParse(t, "GET https://api.example.com/data?key=${secret:MY_KEY}")
+if pq.Plan.SecretRefs != 1 {
+t.Errorf("SecretRefs: want 1, got %d", pq.Plan.SecretRefs)
+}
+}
+
+func TestSecretRefsInHeader(t *testing.T) {
+pq := mustParse(t, `GET https://api.example.com/data
+HEADERS {"Authorization": "Bearer ${secret:API_TOKEN}"}`)
+if pq.Plan.SecretRefs != 1 {
+t.Errorf("SecretRefs: want 1, got %d", pq.Plan.SecretRefs)
+}
+}
+
+func TestMultipleSecretRefsCountedCorrectly(t *testing.T) {
+pq := mustParse(t, `GET https://api.example.com/data
+HEADERS {"Authorization": "Bearer ${secret:TOKEN}", "X-Secret": "${secret:OTHER}"}`)
+if pq.Plan.SecretRefs != 2 {
+t.Errorf("SecretRefs: want 2, got %d", pq.Plan.SecretRefs)
+}
+}
+
+func TestSecretRefsInTextBody(t *testing.T) {
+pq := mustParse(t, "POST https://api.example.com/\nBODY TEXT user=${secret:USER}&pass=${secret:PASS}")
+if pq.Plan.SecretRefs != 2 {
+t.Errorf("SecretRefs: want 2, got %d", pq.Plan.SecretRefs)
+}
+}
+
+func TestEnvRefRejectedInURL(t *testing.T) {
+err := errParse(t, "GET https://api.example.com/data?key=${env:SOME_VAR}")
+if err == nil {
+t.Fatal("expected error for ${env:...} in URL")
+}
+}
+
+func TestEnvRefRejectedInHeader(t *testing.T) {
+err := errParse(t, `GET https://api.example.com/data
+HEADERS {"Authorization": "${env:TOKEN}"}`)
+if err == nil {
+t.Fatal("expected error for ${env:...} in header")
+}
+}
+
+func TestEnvRefRejectedInBody(t *testing.T) {
+err := errParse(t, "POST https://api.example.com/\nBODY TEXT ${env:VAR}")
+if err == nil {
+t.Fatal("expected error for ${env:...} in body")
+}
+}
+
+func TestResponseRefCountedAsPlanDepth(t *testing.T) {
+pq := mustParse(t, `WITH
+  auth AS (POST https://auth.example.com/token
+    BODY FORM grant_type=client_credentials
+  ),
+  api  AS (GET  https://api.example.com/users
+    HEADERS {"Authorization": "Bearer ${response:auth.body.access_token}"})`)
+// The ${response:...} ref should increment PlanDepth.
+if pq.Plan.PlanDepth != 1 {
+t.Errorf("PlanDepth: want 1, got %d", pq.Plan.PlanDepth)
+}
+}
+
+func TestNoSecretRefsWhenNonePlaceholders(t *testing.T) {
+pq := mustParse(t, "GET https://api.example.com/users")
+if pq.Plan.SecretRefs != 0 {
+t.Errorf("SecretRefs: want 0, got %d", pq.Plan.SecretRefs)
+}
+if pq.Plan.PlanDepth != 0 {
+t.Errorf("PlanDepth: want 0, got %d", pq.Plan.PlanDepth)
+}
+}

@@ -16,7 +16,9 @@ import (
 	"github.com/yesoreyeram/httpql/internal/config"
 	"github.com/yesoreyeram/httpql/internal/engine"
 	"github.com/yesoreyeram/httpql/internal/guardrails"
+	"github.com/yesoreyeram/httpql/internal/interpolate"
 	"github.com/yesoreyeram/httpql/internal/policy"
+	"github.com/yesoreyeram/httpql/internal/query"
 	"github.com/yesoreyeram/httpql/internal/secrets"
 )
 
@@ -180,7 +182,73 @@ func (e *Engine) Config() config.Config {
 	return e.cfg
 }
 
-// LookupSecret resolves the named secret using the configured secrets backend.
+// NewWithConfig creates an Engine from a pre-built [config.Config] value.
+// This is useful in tests and when the caller already holds a validated config.
+// opts.ConfigPath is ignored; all other Options fields apply as usual.
+func NewWithConfig(cfg config.Config, opts Options) (*Engine, error) {
+	// ── Resolve admin token ───────────────────────────────────────────────
+	token := opts.AdminToken
+	if token == "" {
+		token = os.Getenv("HTTPQL_ADMIN_TOKEN")
+	}
+	if token == "" && cfg.Engine.Environment == "production" {
+		return nil, fmt.Errorf("httpql: HTTPQL_ADMIN_TOKEN must be set in production")
+	}
+
+	// ── Set up audit logger ───────────────────────────────────────────────
+	auditOut := opts.AuditOutput
+	if auditOut == nil {
+		auditOut = os.Stdout
+	}
+	logger := audit.NewLogger(auditOut, cfg.Engine.InstanceID, cfg.Audit.LogRequestBody)
+
+	// ── Build all guard rail structures ───────────────────────────────────
+	c := cfg.Limits.Concurrency
+	semaPool := guardrails.NewSemaphorePool(guardrails.SemaphorePoolConfig{
+		GlobalRequestsMax:        int64(c.MaxConcurrentRequestsGlobal),
+		GlobalQueriesMax:         int64(c.MaxConcurrentQueriesGlobal),
+		DefaultNSQueriesMax:      int64(c.MaxConcurrentQueriesPerNamespace),
+		DefaultQueryRequestsMax:  int64(c.MaxConcurrentRequestsPerQuery),
+		DefaultOriginRequestsMax: int64(c.MaxConcurrentRequestsPerOrigin),
+	})
+
+	rc2 := cfg.Caching.RequestCache
+	reqCache := cache.NewRequestCache(rc2.MaxEntries, rc2.MaxSizeBytes)
+
+	rsc := cfg.Caching.ResponseCache
+	respCache := cache.NewResponseCache(0, rsc.MaxSizeBytes, rsc.MaxRowsPerEntry)
+
+	resolver := policy.NewResolver(cfg)
+
+	// ── Admin API ─────────────────────────────────────────────────────────
+	adminAPI, err := admin.NewAPI(cfg, resolver, reqCache, respCache, semaPool, logger, token)
+	if err != nil {
+		return nil, fmt.Errorf("httpql: create admin API: %w", err)
+	}
+
+	// ── Secrets provider ──────────────────────────────────────────────────
+	secretProvider, err := secrets.New(cfg.Security.Secrets)
+	if err != nil {
+		return nil, fmt.Errorf("httpql: initialize secrets provider: %w", err)
+	}
+
+	return &Engine{
+		cfg:            cfg,
+		resolver:       resolver,
+		semaPool:       semaPool,
+		reqCache:       reqCache,
+		respCache:      respCache,
+		logger:         logger,
+		adminAPI:       adminAPI,
+		secretProvider: secretProvider,
+	}, nil
+}
+
+// ParseQuery parses an httpql query string and returns the parsed representation.
+// This is a package-level convenience wrapper around [query.Parse].
+func ParseQuery(src string) (*query.ParsedQuery, error) {
+	return query.Parse(src)
+}
 //
 // The key format depends on the active backend:
 //
@@ -193,4 +261,126 @@ func (e *Engine) Config() config.Config {
 // Returns [secrets.ErrNotFound] (wrapped) when the key does not exist.
 func (e *Engine) LookupSecret(ctx context.Context, key string) (string, error) {
 	return e.secretProvider.Lookup(ctx, key)
+}
+
+// QueryResult holds the responses from all named requests in a parsed query.
+// Keys are datasource names from the WITH block; for a simple single-request
+// query the key is an empty string "".
+type QueryResult map[string]*engine.Response
+
+// ExecuteQuery validates and executes a parsed httpql query in the given
+// namespace.  It handles:
+//
+//   - Plan-time validation against the effective policy.
+//   - Secret interpolation: ${secret:KEY} placeholders in URLs, headers,
+//     and body values are resolved through the configured secrets backend.
+//   - Request chaining: ${response:NAME.body.PATH}, ${response:NAME.header.H},
+//     and ${response:NAME.status} placeholders are resolved from prior
+//     responses.  Requests are executed in declaration order so that each
+//     request can reference the output of any request declared before it.
+//
+// The returned QueryResult maps each request's name to its [engine.Response].
+// For a simple (non-WITH) query the single response is stored under the key "".
+func (e *Engine) ExecuteQuery(ctx context.Context, namespace string, pq *query.ParsedQuery) (QueryResult, error) {
+	ep := e.resolver.Resolve(namespace)
+	pq.Plan.Namespace = namespace
+
+	// Plan-time validation.
+	result, err := guardrails.Validate(pq.Plan, ep)
+	if err != nil {
+		return nil, fmt.Errorf("plan validation: %w", err)
+	}
+	if !result.Allowed {
+		return nil, fmt.Errorf("plan validation: query rejected by policy")
+	}
+
+	// Build a per-query executor.
+	ex := engine.NewExecutor(engine.ExecutorConfig{
+		EffectivePolicy: ep,
+		SemaphorePool:   e.semaPool,
+		RequestCache:    e.reqCache,
+		ResponseCache:   e.respCache,
+		Logger:          e.logger,
+	})
+
+	// Acquire query-level admission.
+	releaseQuery, err := e.semaPool.AcquireQuery(ctx, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("query admission: %w", err)
+	}
+	defer releaseQuery()
+
+	// Create runtime context for this query.
+	rc := guardrails.NewRuntimeContext(ep)
+	deadlineCtx, cancel := rc.ContextWithDeadline(ctx)
+	defer cancel()
+
+	// Execute requests in declaration order, accumulating responses so that
+	// later requests can reference earlier ones via ${response:NAME...}.
+	responses := make(map[string]interpolate.Response, len(pq.Requests))
+	out := make(QueryResult, len(pq.Requests))
+
+	for _, nr := range pq.Requests {
+		// Interpolate the request (resolve ${secret:...} and ${response:...}).
+		resolved, err := e.interpolateRequest(deadlineCtx, nr.Request, responses)
+		if err != nil {
+			return nil, fmt.Errorf("interpolate request %q: %w", nr.Name, err)
+		}
+
+		resp, err := ex.Execute(deadlineCtx, rc, resolved)
+		if err != nil {
+			return nil, fmt.Errorf("execute request %q: %w", nr.Name, err)
+		}
+
+		// Store for subsequent interpolation and final output.
+		responses[nr.Name] = interpolate.Response{
+			StatusCode: resp.StatusCode,
+			Headers:    resp.Headers,
+			Body:       resp.Body,
+		}
+		out[nr.Name] = resp
+	}
+
+	return out, nil
+}
+
+// interpolateRequest returns a copy of req with all ${...} placeholders
+// expanded using the configured secrets backend and any accumulated responses.
+func (e *Engine) interpolateRequest(ctx context.Context, req engine.Request, responses map[string]interpolate.Response) (engine.Request, error) {
+	sp := e.secretProvider
+
+	expandStr := func(s string) (string, error) {
+		return interpolate.Expand(ctx, s, sp, responses)
+	}
+
+	// URL
+	u, err := expandStr(req.URL)
+	if err != nil {
+		return req, fmt.Errorf("URL: %w", err)
+	}
+	req.URL = u
+
+	// Headers
+	if len(req.Headers) > 0 {
+		expanded := make(map[string]string, len(req.Headers))
+		for k, v := range req.Headers {
+			ev, err := expandStr(v)
+			if err != nil {
+				return req, fmt.Errorf("header %q: %w", k, err)
+			}
+			expanded[k] = ev
+		}
+		req.Headers = expanded
+	}
+
+	// Raw Body bytes (non-provider path).
+	if len(req.Body) > 0 {
+		eb, err := expandStr(string(req.Body))
+		if err != nil {
+			return req, fmt.Errorf("body: %w", err)
+		}
+		req.Body = []byte(eb)
+	}
+
+	return req, nil
 }

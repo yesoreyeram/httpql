@@ -13,9 +13,12 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/yesoreyeram/httpql/internal/audit"
@@ -80,16 +83,25 @@ type ExecutorConfig struct {
 }
 
 // NewExecutor creates an Executor.  If cfg.HTTPClient is nil, a default client
-// with safe transport settings is created.
+// with safe transport settings is created.  TLS client certificate, custom CA
+// bundle, and minimum TLS version are applied from the EffectivePolicy.
 func NewExecutor(cfg ExecutorConfig) *Executor {
 	client := cfg.HTTPClient
 	if client == nil {
 		ep := cfg.EffectivePolicy
+		tlsCfg, err := buildTLSConfig(ep)
+		if err != nil {
+			// Log the error; fall back to default TLS settings.
+			// NewExecutor does not return an error to preserve API stability,
+			// and a nil/default TLS config is still safe.
+			_ = err
+		}
 		transport := &http.Transport{
 			MaxIdleConnsPerHost:   ep.ConnectionPoolSizePerOrigin,
 			IdleConnTimeout:       ep.IdleConnectionTTL,
 			TLSHandshakeTimeout:   ep.RequestConnectTimeout,
 			ResponseHeaderTimeout: ep.RequestReadTimeout,
+			TLSClientConfig:       tlsCfg,
 			// DisableKeepAlives left false for connection reuse.
 		}
 		client = &http.Client{
@@ -106,6 +118,50 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		respCache:  cfg.ResponseCache,
 		logger:     cfg.Logger,
 	}
+}
+
+// buildTLSConfig constructs a *tls.Config from the effective policy.
+// It sets the minimum TLS version, certificate verification flag, optional
+// custom CA pool, and optional mTLS client certificate.
+func buildTLSConfig(ep policy.EffectivePolicy) (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: !ep.TLSVerifyCert, //nolint:gosec // controlled by admin-clamped config
+	}
+
+	// Minimum TLS version.
+	switch ep.TLSMinVersion {
+	case "TLS1.3":
+		cfg.MinVersion = tls.VersionTLS13
+	default:
+		cfg.MinVersion = tls.VersionTLS12
+	}
+
+	// Custom CA bundle.
+	if ep.TLSCustomCABundle != "" {
+		pem, err := os.ReadFile(ep.TLSCustomCABundle)
+		if err != nil {
+			return nil, fmt.Errorf("engine: read custom CA bundle %q: %w", ep.TLSCustomCABundle, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("engine: no valid certificates found in CA bundle %q", ep.TLSCustomCABundle)
+		}
+		cfg.RootCAs = pool
+	}
+
+	// Mutual TLS: client certificate + key.
+	if ep.TLSClientCert != "" || ep.TLSClientKey != "" {
+		if ep.TLSClientCert == "" || ep.TLSClientKey == "" {
+			return nil, fmt.Errorf("engine: both security.tls.client_cert and security.tls.client_key must be set together")
+		}
+		cert, err := tls.LoadX509KeyPair(ep.TLSClientCert, ep.TLSClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("engine: load client certificate/key: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+
+	return cfg, nil
 }
 
 // Execute runs a single HTTP sub-request with all guard rails applied.

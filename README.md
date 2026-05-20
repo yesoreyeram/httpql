@@ -48,6 +48,14 @@ logging are all on by default.
   - [k8s backend](#k8s-backend)
   - [aws-ssm backend](#aws-ssm-backend)
   - [Using secrets in Go](#using-secrets-in-go)
+  - [Secret references in queries](#secret-references-in-queries)
+  - [No direct environment-variable access](#no-direct-environment-variable-access)
+- [TLS client certificates](#tls-client-certificates)
+- [Request chaining](#request-chaining)
+  - [Chaining syntax](#chaining-syntax)
+  - [Response reference types](#response-reference-types)
+  - [Execution order](#execution-order)
+  - [Chaining in Go](#chaining-in-go)
 - [Admin API](#admin-api)
 - [Default limits](#default-limits)
 - [Security guarantees](#security-guarantees)
@@ -816,6 +824,233 @@ if err != nil {
 }
 // Use val in a request header, body, etc.
 ```
+
+### Secret references in queries
+
+You can reference secrets directly in query strings using the `${secret:KEY}`
+placeholder.  The engine resolves the placeholder through the configured secrets
+backend at query-execution time — the secret value is never written to logs or
+included in cache keys.
+
+Placeholders are supported in:
+
+| Location | Example |
+|----------|---------|
+| URL (any component) | `GET https://api.example.com/data?token=${secret:API_TOKEN}` |
+| Header values | `HEADERS {"Authorization": "Bearer ${secret:API_TOKEN}"}` |
+| Body (TEXT / RAW / FORM) | `BODY TEXT user=${secret:DB_USER}&pass=${secret:DB_PASS}` |
+
+**Example — Bearer token from Vault:**
+
+```
+GET https://api.example.com/users
+HEADERS {"Authorization": "Bearer ${secret:services/myapp/api_key}"}
+```
+
+**Example — Basic auth using form-encoded credentials:**
+
+```
+POST https://api.example.com/login
+BODY FORM username=${secret:app/db/username}&password=${secret:app/db/password}
+```
+
+**Example — Multi-datasource WITH block with secrets:**
+
+```
+WITH
+  orders AS (GET https://orders.example.com/api/orders
+    HEADERS {"X-Api-Key": "${secret:orders/api_key}"}
+  ),
+  payments AS (GET https://payments.example.com/api/txns
+    HEADERS {"Authorization": "Bearer ${secret:payments/token}"}
+  )
+```
+
+The number of secret references in a query is validated against
+`security.max_secret_refs_per_query` (default 5, hard maximum 20).
+
+### No direct environment-variable access
+
+httpql explicitly **blocks** the `${env:VAR}` placeholder.  Queries that use
+`${env:...}` are rejected at parse time with a clear error message:
+
+```
+httpql: ${env:...} is not allowed in queries; use ${secret:KEY} instead
+```
+
+This is a deliberate security boundary.  All secrets must go through the
+configured backend (`env`, `vault`, `k8s`, or `aws-ssm`) so that:
+
+1. Secret access is **audited** — every lookup is logged (the value itself is
+   never written, only the fact that a lookup occurred).
+2. Access is **rate-limited** via `max_secret_refs_per_query`.
+3. The admin can **switch backends** (from `env` to Vault, K8s, or AWS SSM)
+   without touching any query files.
+
+If you want to expose an environment variable as a secret use the `env` backend
+and reference it as `${secret:MY_VAR}`.
+
+---
+
+## TLS client certificates
+
+httpql supports mutual TLS (mTLS) for outbound connections.  Three TLS options
+can be configured in the `security.tls` section of the config file:
+
+| Field | Description |
+|-------|-------------|
+| `client_cert` | Path to a PEM-encoded client certificate file |
+| `client_key` | Path to a PEM-encoded private key file (matches `client_cert`) |
+| `custom_ca_bundle` | Path to a PEM-encoded CA certificate file for server verification |
+
+`client_cert` and `client_key` must **both** be set or **both** be absent.
+
+```yaml
+security:
+  tls:
+    min_version: TLS1.2        # TLS1.2 | TLS1.3
+    verify_cert: true          # hardcoded true in production
+    custom_ca_bundle: /etc/ssl/certs/internal-ca.pem
+    client_cert: /etc/ssl/certs/client.crt
+    client_key:  /etc/ssl/private/client.key
+```
+
+**When `custom_ca_bundle` is set**, the CA file is used as the root of trust
+for all outbound TLS connections made by the engine.  The system certificate
+pool is replaced with the custom bundle, so ensure the bundle includes all
+necessary intermediate and root certificates.
+
+**When `client_cert` + `client_key` are set**, the engine presents the client
+certificate for every outbound HTTPS connection.  This enables mutual TLS where
+the remote server verifies the client's identity.
+
+All TLS configuration is read at engine-startup time (not per-request) and is
+fully validated before any requests are made.
+
+---
+
+## Request chaining
+
+Request chaining lets you extract values from one HTTP response and pass them
+to subsequent requests — in the URL, headers, or body.  This is useful for
+multi-step flows like OAuth token exchange, paginated list + detail lookups, and
+any workflow that depends on the output of a prior call.
+
+### Chaining syntax
+
+Add `${response:NAME.ACCESSOR}` placeholders in the URL, headers, or body of a
+later request.  `NAME` must match the alias given to an earlier request in the
+same WITH block.
+
+```
+WITH
+  auth AS (POST https://auth.example.com/oauth/token
+    BODY FORM grant_type=client_credentials&scope=read
+  ),
+  users AS (GET https://api.example.com/users
+    HEADERS {"Authorization": "Bearer ${response:auth.body.access_token}"}
+  )
+```
+
+### Response reference types
+
+| Placeholder | Resolves to |
+|-------------|-------------|
+| `${response:NAME.body.FIELD}` | A field in the JSON response body.  Supports nested paths (`a.b.c`) and array indexing (`items[0].id`). |
+| `${response:NAME.header.Header-Name}` | A response header value (case-insensitive lookup). |
+| `${response:NAME.status}` | The HTTP status code as a string, e.g. `"200"`. |
+
+**Body path examples:**
+
+| JSON body | Placeholder | Result |
+|-----------|-------------|--------|
+| `{"token": "abc"}` | `${response:auth.body.token}` | `abc` |
+| `{"data": {"id": 42}}` | `${response:step1.body.data.id}` | `42` |
+| `{"items": [{"id": 1}, {"id": 99}]}` | `${response:list.body.items[1].id}` | `99` |
+
+**Header example:**
+
+```
+WITH
+  init AS (GET https://api.example.com/session),
+  detail AS (GET https://api.example.com/resource
+    HEADERS {"X-Session-Id": "${response:init.header.X-Session-Id}"}
+  )
+```
+
+**Status code example:**
+
+```
+WITH
+  create AS (POST https://api.example.com/items
+    BODY JSON {"name": "widget"}
+  ),
+  audit  AS (POST https://audit.example.com/log
+    BODY JSON {"event": "create", "status": "${response:create.status}"}
+  )
+```
+
+**Combining secrets and response references:**
+
+```
+WITH
+  token AS (POST https://auth.example.com/token
+    HEADERS {"X-Client-Id": "${secret:oauth/client_id}",
+             "X-Client-Secret": "${secret:oauth/client_secret}"}
+  ),
+  data  AS (GET https://api.example.com/data
+    HEADERS {"Authorization": "${response:token.body.token_type} ${response:token.body.access_token}"}
+  )
+```
+
+### Execution order
+
+Requests in a WITH block are executed **in declaration order**.  Each request
+is fully resolved (secrets and previous-response references expanded) before it
+is sent.  This guarantees that any `${response:NAME...}` reference is
+available by the time the referencing request runs.
+
+If a `${response:NAME...}` placeholder refers to a request that has **not yet
+run** (or does not exist), `ExecuteQuery` returns an error.
+
+### Chaining in Go
+
+Use `engine.ExecuteQuery` instead of `engine.ExecuteRequest` to execute a
+parsed query with full chaining support:
+
+```go
+import (
+    "context"
+    "github.com/yesoreyeram/httpql/pkg/httpql"
+)
+
+engine, _ := httpql.New(httpql.Options{ConfigPath: "httpql-engine.yaml"})
+
+pq, err := httpql.ParseQuery(`WITH
+  auth AS (POST https://auth.example.com/token
+    BODY FORM grant_type=client_credentials
+  ),
+  users AS (GET https://api.example.com/users
+    HEADERS {"Authorization": "Bearer ${response:auth.body.access_token}"}
+  )`)
+if err != nil {
+    // parse / validation error
+}
+
+result, err := engine.ExecuteQuery(context.Background(), "default", pq)
+if err != nil {
+    // execution error (secret lookup failed, network error, policy violation, etc.)
+}
+
+authResp  := result["auth"]   // *engine.Response for the auth step
+usersResp := result["users"]  // *engine.Response for the users step
+_ = authResp
+_ = usersResp
+```
+
+`ExecuteQuery` returns a `QueryResult` (a `map[string]*engine.Response`) keyed
+by the datasource name from the WITH block.  For a simple query without a WITH
+block the single response is stored under the empty-string key `""`.
 
 ---
 

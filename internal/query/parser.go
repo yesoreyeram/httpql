@@ -10,6 +10,7 @@ import (
 
 	"github.com/yesoreyeram/httpql/internal/body"
 	"github.com/yesoreyeram/httpql/internal/engine"
+	"github.com/yesoreyeram/httpql/internal/interpolate"
 )
 
 // Parse parses src as an httpql query and returns the corresponding
@@ -69,6 +70,15 @@ func (p *parser) parseQuery() (*ParsedQuery, error) {
 	for _, nr := range pq.Requests {
 		if nr.Request.URL != "" {
 			pq.Plan.URLs = append(pq.Plan.URLs, nr.Request.URL)
+		}
+		// Count and validate placeholder references across URL, headers and body.
+		allStrings := collectRequestStrings(nr.Request)
+		for _, s := range allStrings {
+			if interpolate.HasEnvRef(s) {
+				return nil, fmt.Errorf("httpql: ${env:...} is not allowed in queries; use ${secret:KEY} instead")
+			}
+			pq.Plan.SecretRefs += interpolate.CountSecretRefs(s)
+			pq.Plan.PlanDepth += interpolate.CountResponseRefs(s)
 		}
 	}
 
@@ -444,4 +454,34 @@ func parseFormValues(s string) url.Values {
 		}
 	}
 	return vals
+}
+
+// collectRequestStrings gathers all user-supplied string values from a request
+// that can contain ${...} placeholders: URL, header values, and body text.
+func collectRequestStrings(req engine.Request) []string {
+	var ss []string
+	ss = append(ss, req.URL)
+	for _, v := range req.Headers {
+		ss = append(ss, v)
+	}
+	if req.BodyProvider != nil {
+		switch bp := req.BodyProvider.(type) {
+		case body.Text:
+			ss = append(ss, string(bp.Data))
+		case body.Raw:
+			ss = append(ss, string(bp.Data))
+		case body.Form:
+			for _, vals := range bp.Values {
+				ss = append(ss, vals...)
+			}
+		}
+		// JSON and GraphQL bodies can technically contain placeholders but they
+		// must be valid JSON at parse time, so placeholders would have to be
+		// valid JSON string values.  We skip deep-scanning them here; the
+		// interpolation engine handles them at execution time.
+	}
+	if len(req.Body) > 0 {
+		ss = append(ss, string(req.Body))
+	}
+	return ss
 }

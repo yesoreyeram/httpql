@@ -116,10 +116,22 @@ func (s *scanner) scanInt() tok {
 
 // scanWord reads a contiguous run of non-whitespace, non-special characters.
 // If the result contains "://" it is classified as a URL token.
+// ${...} interpolation placeholders are treated as part of the word.
 func (s *scanner) scanWord() tok {
 	start := s.pos
 	for s.pos < len(s.r) {
 		c := s.r[s.pos]
+		// ${...} interpolation blocks are part of the current word/URL.
+		if c == '$' && s.pos+1 < len(s.r) && s.r[s.pos+1] == '{' {
+			s.pos += 2 // skip '${'
+			for s.pos < len(s.r) && s.r[s.pos] != '}' {
+				s.pos++
+			}
+			if s.pos < len(s.r) {
+				s.pos++ // skip '}'
+			}
+			continue
+		}
 		if unicode.IsSpace(c) || c == ',' || c == '(' || c == ')' ||
 			c == '{' || c == '[' || c == '"' {
 			break

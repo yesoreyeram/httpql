@@ -81,6 +81,16 @@ type EffectivePolicy struct {
 	PrivateIPAllowlist     []string
 	TLSMinVersion          string
 	TLSVerifyCert          bool
+	// TLSClientCert is the path to the PEM-encoded client certificate file.
+	// When non-empty, mutual TLS is used for outbound connections.
+	TLSClientCert string
+	// TLSClientKey is the path to the PEM-encoded private key file that
+	// corresponds to TLSClientCert.
+	TLSClientKey string
+	// TLSCustomCABundle is the path to a PEM-encoded CA certificate file
+	// used to verify server certificates in addition to (or instead of)
+	// the system roots.
+	TLSCustomCABundle string
 	MaxSecretRefsPerQuery  int
 	MaxQueryPlanDepth      int
 	AllowHTTPScheme        bool
@@ -182,6 +192,9 @@ func (r *Resolver) Resolve(namespace string) EffectivePolicy {
 		PrivateIPAllowlist:    copyStrings(g.Security.PrivateIPAllowlist),
 		TLSMinVersion:         g.Security.TLS.MinVersion,
 		TLSVerifyCert:         g.Security.TLS.VerifyCert,
+		TLSClientCert:         g.Security.TLS.ClientCert,
+		TLSClientKey:          g.Security.TLS.ClientKey,
+		TLSCustomCABundle:     g.Security.TLS.CustomCABundle,
 		MaxSecretRefsPerQuery: g.Security.MaxSecretRefsPerQuery,
 		MaxQueryPlanDepth:     g.Security.MaxQueryPlanDepth,
 		AllowHTTPScheme:       g.Security.AllowHTTPScheme,
