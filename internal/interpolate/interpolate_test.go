@@ -3,6 +3,7 @@ package interpolate_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/yesoreyeram/httpql/internal/interpolate"
@@ -121,7 +122,7 @@ func TestExpand_EnvRefRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for ${env:...}")
 	}
-	if !containsStr(err.Error(), "${env:...} is not allowed") {
+	if !strings.Contains(err.Error(), "${env:...} is not allowed") {
 		t.Errorf("expected 'is not allowed' in error message, got: %v", err)
 	}
 }
@@ -410,18 +411,4 @@ func TestExpand_JSONPath_ObjectValue(t *testing.T) {
 	if got != `{"k":"v"}` {
 		t.Errorf("want json object, got %q", got)
 	}
-}
-
-// ─── helper ───────────────────────────────────────────────────────────────────
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		func() bool {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}())
 }

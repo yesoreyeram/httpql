@@ -325,7 +325,7 @@ func (e *Executor) readBodyWithGuard(ctx context.Context, rc *guardrails.Runtime
 // map is a shallow copy of req.Headers so the original is never mutated.
 func resolveBody(req Request) (rawBody []byte, headers map[string]string, err error) {
 	// Copy caller headers to avoid mutating the original.
-	headers = make(map[string]string, len(req.Headers)+1)
+	headers = make(map[string]string, len(req.Headers))
 	for k, v := range req.Headers {
 		headers[k] = v
 	}
