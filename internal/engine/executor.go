@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/yesoreyeram/httpql/internal/audit"
+	"github.com/yesoreyeram/httpql/internal/body"
 	"github.com/yesoreyeram/httpql/internal/cache"
 	"github.com/yesoreyeram/httpql/internal/guardrails"
 	"github.com/yesoreyeram/httpql/internal/policy"
@@ -36,7 +37,14 @@ type Request struct {
 	Method  string
 	URL     string
 	Headers map[string]string
-	Body    []byte
+	// Body is the raw request body.  Mutually exclusive with BodyProvider:
+	// if BodyProvider is non-nil it takes precedence and Body is ignored.
+	Body []byte
+	// BodyProvider, when non-nil, is called to serialise the request body and
+	// supply the Content-Type header automatically.  It takes precedence over
+	// the raw Body field.  See the body package for supported types:
+	//   body.JSON, body.Form, body.Multipart, body.GraphQL, body.XML, body.Text, body.Raw
+	BodyProvider body.Provider
 
 	// CacheTTL, if > 0, enables request-level caching for this request.
 	CacheTTL time.Duration
@@ -103,18 +111,25 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 // Execute runs a single HTTP sub-request with all guard rails applied.
 //
 // Enforcement order:
-//  1. Acquire request semaphore slots (global + per-query + per-origin)
-//  2. Check request cache
-//  3. Check runtime budget (request count + wall-clock)
-//  4. Issue HTTP request with read timeout
-//  5. Check response headers
-//  6. Stream body with size guard
-//  7. Store in request cache (if TTL > 0)
+//  1. Resolve BodyProvider (if set) to raw bytes + Content-Type
+//  2. Acquire request semaphore slots (global + per-query + per-origin)
+//  3. Check request cache
+//  4. Check runtime budget (request count + wall-clock)
+//  5. Issue HTTP request with read timeout
+//  6. Check response headers
+//  7. Stream body with size guard
+//  8. Store in request cache (if TTL > 0)
 func (e *Executor) Execute(ctx context.Context, rc *guardrails.RuntimeContext, req Request) (*Response, error) {
+	// ── Step 1: Resolve BodyProvider ─────────────────────────────────────
+	rawBody, reqHeaders, err := resolveBody(req)
+	if err != nil {
+		return nil, fmt.Errorf("body provider: %w", err)
+	}
+
 	// Derive origin from URL for per-origin semaphore.
 	origin := extractOrigin(req.URL)
 
-	// ── Step 1: Acquire semaphore slots ───────────────────────────────────
+	// ── Step 2: Acquire semaphore slots ───────────────────────────────────
 	queueCtx, queueCancel := context.WithTimeout(ctx, e.ep.RequestQueueTimeout)
 	defer queueCancel()
 
@@ -124,8 +139,8 @@ func (e *Executor) Execute(ctx context.Context, rc *guardrails.RuntimeContext, r
 	}
 	defer releaseRequest()
 
-	// ── Step 2: Request cache lookup ──────────────────────────────────────
-	cacheKey := cache.RequestCacheKey(req.Namespace, req.Method, req.URL, req.Headers, req.Body)
+	// ── Step 3: Request cache lookup ──────────────────────────────────────
+	cacheKey := cache.RequestCacheKey(req.Namespace, req.Method, req.URL, reqHeaders, rawBody)
 	if e.reqCache != nil && e.ep.RequestCacheEnabled {
 		if entry, ok := e.reqCache.Get(ctx, cacheKey); ok {
 			e.logger.Log(audit.Event{
@@ -145,19 +160,19 @@ func (e *Executor) Execute(ctx context.Context, rc *guardrails.RuntimeContext, r
 		}
 	}
 
-	// ── Step 3: Runtime budget check ─────────────────────────────────────
+	// ── Step 4: Runtime budget check ─────────────────────────────────────
 	if err := rc.CheckBudgetBeforeRequest(ctx); err != nil {
 		return nil, err
 	}
 
-	// ── Step 4: Issue HTTP request ────────────────────────────────────────
+	// ── Step 5: Issue HTTP request ────────────────────────────────────────
 	e.logger.LogRequest(req.TraceID, req.Namespace, req.QueryID, req.Method, audit.SanitiseURL(req.URL))
 
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(rawBody))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	for k, v := range req.Headers {
+	for k, v := range reqHeaders {
 		httpReq.Header.Set(k, v)
 	}
 
@@ -176,12 +191,12 @@ func (e *Executor) Execute(ctx context.Context, rc *guardrails.RuntimeContext, r
 	}
 	defer resp.Body.Close()
 
-	// ── Step 5: Response header check ────────────────────────────────────
+	// ── Step 6: Response header check ────────────────────────────────────
 	if err := rc.CheckResponseHeaders(len(resp.Header)); err != nil {
 		return nil, err
 	}
 
-	// ── Step 6: Stream body with size guard ───────────────────────────────
+	// ── Step 7: Stream body with size guard ───────────────────────────────
 	body, bodyErr := e.readBodyWithGuard(ctx, rc, resp.Body)
 	if bodyErr != nil {
 		return nil, bodyErr
@@ -204,7 +219,7 @@ func (e *Executor) Execute(ctx context.Context, rc *guardrails.RuntimeContext, r
 		Body:       body,
 	}
 
-	// ── Step 7: Store in request cache ───────────────────────────────────
+	// ── Step 8: Store in request cache ───────────────────────────────────
 	if e.reqCache != nil && e.ep.RequestCacheEnabled && req.CacheTTL > 0 {
 		ttl := req.CacheTTL
 		if ttl > e.ep.RequestCacheMaxTTL {
@@ -247,6 +262,34 @@ func (e *Executor) readBodyWithGuard(ctx context.Context, rc *guardrails.Runtime
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+// resolveBody returns the raw body bytes and the effective request headers.
+// If req.BodyProvider is set it takes precedence: Build() is called to
+// produce the bytes and supply the Content-Type header.  The returned headers
+// map is a shallow copy of req.Headers so the original is never mutated.
+func resolveBody(req Request) (rawBody []byte, headers map[string]string, err error) {
+	// Copy caller headers to avoid mutating the original.
+	headers = make(map[string]string, len(req.Headers)+1)
+	for k, v := range req.Headers {
+		headers[k] = v
+	}
+
+	if req.BodyProvider == nil {
+		return req.Body, headers, nil
+	}
+
+	var ct string
+	rawBody, ct, err = req.BodyProvider.Build()
+	if err != nil {
+		return nil, nil, err
+	}
+	// Only set Content-Type from the provider when the caller has not already
+	// supplied their own value — caller header wins.
+	if _, alreadySet := headers["Content-Type"]; !alreadySet && ct != "" {
+		headers["Content-Type"] = ct
+	}
+	return rawBody, headers, nil
+}
 
 func extractOrigin(rawURL string) string {
 	// Minimal origin extraction: scheme + host.

@@ -171,4 +171,137 @@ cmd/httpql/   Server entrypoint
 | `HTTPQL_CONFIG` | No | Path to config file |
 | `HTTPQL_CONFIG_HMAC_KEY` | No | Hex HMAC key for config signature |
 | `HTTPQL_ADMIN_TOKEN` | **Yes in production** | Bearer token for `/admin/*` |
+
+---
+
+### HTTP POST body methods
+
+The `engine.Request` struct accepts an optional `BodyProvider` field (from the
+`internal/body` package) that handles serialisation and sets the correct
+`Content-Type` header automatically.  The raw `Body []byte` field is still
+supported for backward compatibility when `BodyProvider` is `nil`.
+
+If you set **both** `BodyProvider` and a `Content-Type` header in `Headers`,
+the caller-supplied header wins.
+
+| Method | Type | Content-Type set automatically |
+|--------|------|-------------------------------|
+| Raw bytes | `body.Raw` | caller-supplied (defaults to `application/octet-stream`) |
+| JSON | `body.JSON` | `application/json` |
+| URL-encoded form | `body.Form` | `application/x-www-form-urlencoded` |
+| Multipart form data | `body.Multipart` | `multipart/form-data; boundary=…` |
+| GraphQL | `body.GraphQL` | `application/json` |
+| XML | `body.XML` | `application/xml` |
+| Plain text | `body.Text` | `text/plain; charset=utf-8` |
+
+#### JSON
+
+```go
+req := engine.Request{
+    Method:       "POST",
+    URL:          "https://api.example.com/items",
+    BodyProvider: body.JSON{Value: map[string]any{"name": "widget", "qty": 5}},
+}
+```
+
+#### URL-encoded form
+
+```go
+req := engine.Request{
+    Method: "POST",
+    URL:    "https://example.com/login",
+    BodyProvider: body.Form{Values: url.Values{
+        "username": {"alice"},
+        "password": {"s3cr3t"},
+    }},
+}
+```
+
+#### Multipart form data (file upload)
+
+```go
+req := engine.Request{
+    Method: "POST",
+    URL:    "https://example.com/upload",
+    BodyProvider: body.Multipart{Parts: []body.Part{
+        {Name: "title", Data: []byte("My Document")},
+        {
+            Name:        "file",
+            Filename:    "report.pdf",
+            ContentType: "application/pdf",
+            Data:        pdfBytes,
+        },
+    }},
+}
+```
+
+#### GraphQL
+
+```go
+req := engine.Request{
+    Method: "POST",
+    URL:    "https://api.example.com/graphql",
+    BodyProvider: body.GraphQL{
+        Query: `query GetUser($id: ID!) { user(id: $id) { name email } }`,
+        Variables: map[string]any{"id": "42"},
+    },
+}
+```
+
+#### XML
+
+```go
+// From pre-built bytes:
+req := engine.Request{
+    Method:       "POST",
+    URL:          "https://soap.example.com/service",
+    BodyProvider: body.XML{Data: []byte(`<soap:Envelope>…</soap:Envelope>`)},
+}
+
+// From a Go struct (encoding/xml):
+type Item struct {
+    XMLName xml.Name `xml:"item"`
+    Name    string   `xml:"name"`
+}
+req2 := engine.Request{
+    Method:       "POST",
+    URL:          "https://api.example.com/items",
+    BodyProvider: body.XML{Value: Item{Name: "widget"}},
+}
+```
+
+#### Plain text
+
+```go
+req := engine.Request{
+    Method:       "POST",
+    URL:          "https://example.com/log",
+    BodyProvider: body.Text{Data: []byte("event=login user=alice")},
+}
+```
+
+#### Raw bytes (pass-through)
+
+```go
+req := engine.Request{
+    Method: "POST",
+    URL:    "https://example.com/binary",
+    BodyProvider: body.Raw{
+        ContentType: "application/octet-stream",
+        Data:        []byte{0xDE, 0xAD, 0xBE, 0xEF},
+    },
+}
+```
+
+#### Backward-compatible raw body (no provider)
+
+```go
+req := engine.Request{
+    Method:  "POST",
+    URL:     "https://example.com/json",
+    Headers: map[string]string{"Content-Type": "application/json"},
+    Body:    []byte(`{"key":"value"}`),
+    // BodyProvider is nil — Body field is used directly.
+}
+```
 | `HTTPQL_ADMIN_ADDR` | No | Admin API listen address (default `:9091`) |
