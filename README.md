@@ -42,6 +42,12 @@ logging are all on by default.
   - [Full config reference](#full-config-reference)
 - [Signing the config file](#signing-the-config-file)
 - [Environment variables](#environment-variables)
+- [Secrets](#secrets)
+  - [env backend](#env-backend)
+  - [vault backend](#vault-backend)
+  - [k8s backend](#k8s-backend)
+  - [aws-ssm backend](#aws-ssm-backend)
+  - [Using secrets in Go](#using-secrets-in-go)
 - [Admin API](#admin-api)
 - [Default limits](#default-limits)
 - [Security guarantees](#security-guarantees)
@@ -666,6 +672,150 @@ is loaded without signature verification.
 | `HTTPQL_CONFIG_HMAC_KEY` | No | Hex-encoded HMAC-SHA256 key for config signature verification |
 | `HTTPQL_ADMIN_TOKEN` | **Yes in production** | Bearer token required for all `/admin/*` endpoints |
 | `HTTPQL_ADMIN_ADDR` | No | Admin API listen address (default: `:9091`) |
+
+---
+
+## Secrets
+
+httpql ships with a pluggable secrets backend.  All four backends share the
+same interface — `LookupSecret(ctx, key)` — so you can switch backends without
+touching query files.  Secret values are **never written to any log** regardless
+of which backend is active; this is a hardcoded invariant enforced in
+`config.Clamp()`.
+
+Select the backend in your config file:
+
+```yaml
+security:
+  secrets:
+    backend: env          # env | vault | k8s | aws-ssm
+```
+
+### env backend
+
+Reads secrets from process environment variables.  No extra configuration is
+needed.
+
+**Key format:** exact environment-variable name (e.g. `MY_API_KEY`).
+
+```yaml
+security:
+  secrets:
+    backend: env
+```
+
+```go
+val, err := engine.LookupSecret(ctx, "MY_API_KEY")
+```
+
+### vault backend
+
+Reads secrets from HashiCorp Vault's **KV Secrets Engine v2** using the
+Vault HTTP API.  No third-party SDK is required.
+
+**Key format:** `{secret-path}/{field}`
+
+The path up to the last `/` is the Vault secret path; the last segment is the
+field name within the secret's data map.
+
+**Example:** key `database/postgres/password` resolves to
+
+```
+GET {vault_address}/v1/{mount}/data/database/postgres
+→ response.data.data["password"]
+```
+
+**Environment variable:** `VAULT_TOKEN` (or whatever `token_env` is set to)
+must hold a valid Vault token with read access to the path.
+
+```yaml
+security:
+  secrets:
+    backend: vault
+    vault:
+      address: https://vault.internal.example.com
+      mount: secret          # KV v2 mount name (default: secret)
+      token_env: VAULT_TOKEN # env var that holds the Vault token
+```
+
+### k8s backend
+
+Reads secrets from the **Kubernetes Secrets API** using the pod's service
+account bearer token.  No third-party SDK is required; the implementation
+uses only the standard `net/http` package.
+
+**Key format:** `{secret-name}/{data-key}`
+
+**Example:** key `db-credentials/password` resolves to
+
+```
+GET {k8s_api}/api/v1/namespaces/{namespace}/secrets/db-credentials
+→ base64-decode(response.data["password"])
+```
+
+```yaml
+security:
+  secrets:
+    backend: k8s
+    k8s:
+      namespace: production          # leave empty to use pod's own namespace
+      service_account_token_path: /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+The pod CA certificate at
+`/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` is used automatically
+when present; otherwise the system TLS roots are used (suitable for external
+clusters with a valid certificate chain).
+
+### aws-ssm backend
+
+Reads secrets from **AWS Systems Manager Parameter Store** (`SecureString`
+parameters are decrypted automatically).  The implementation uses AWS Signature
+Version 4 (SigV4) signed HTTP requests — no AWS SDK is required.
+
+**Key format:** parameter name.  The configured `prefix` is prepended
+automatically when it is not already present.
+
+**Example:** with `prefix: /httpql/` and key `db/password`, the resolved
+parameter name is `/httpql/db/password`.
+
+| Environment variable | Required | Description |
+|----------------------|----------|-------------|
+| `AWS_ACCESS_KEY_ID` | **Yes** | AWS access key ID |
+| `AWS_SECRET_ACCESS_KEY` | **Yes** | AWS secret access key |
+| `AWS_SESSION_TOKEN` | No | Session token for temporary credentials |
+| `AWS_DEFAULT_REGION` / `AWS_REGION` | No (if set in config) | AWS region |
+
+```yaml
+security:
+  secrets:
+    backend: aws-ssm
+    aws_ssm:
+      region: us-east-1
+      prefix: /httpql/     # prepended to every key automatically
+```
+
+### Using secrets in Go
+
+```go
+import (
+    "context"
+    "github.com/yesoreyeram/httpql/internal/secrets"
+    "github.com/yesoreyeram/httpql/pkg/httpql"
+)
+
+engine, _ := httpql.New(httpql.Options{ConfigPath: "httpql-engine.yaml"})
+
+// Resolve a secret through the configured backend.
+val, err := engine.LookupSecret(context.Background(), "MY_API_KEY")
+if err != nil {
+    if secrets.IsNotFound(err) {
+        // key does not exist in the backend
+    }
+    // handle transport / auth error
+}
+// Use val in a request header, body, etc.
+```
 
 ---
 

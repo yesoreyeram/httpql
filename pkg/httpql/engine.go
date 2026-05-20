@@ -17,18 +17,20 @@ import (
 	"github.com/yesoreyeram/httpql/internal/engine"
 	"github.com/yesoreyeram/httpql/internal/guardrails"
 	"github.com/yesoreyeram/httpql/internal/policy"
+	"github.com/yesoreyeram/httpql/internal/secrets"
 )
 
 // Engine is the top-level httpql engine.  Create one with New() and use it
 // to execute queries with full guard rail enforcement.
 type Engine struct {
-	cfg       config.Config
-	resolver  *policy.Resolver
-	semaPool  *guardrails.SemaphorePool
-	reqCache  *cache.RequestCache
-	respCache *cache.ResponseCache
-	logger    *audit.Logger
-	adminAPI  *admin.API
+	cfg            config.Config
+	resolver       *policy.Resolver
+	semaPool       *guardrails.SemaphorePool
+	reqCache       *cache.RequestCache
+	respCache      *cache.ResponseCache
+	logger         *audit.Logger
+	adminAPI       *admin.API
+	secretProvider secrets.Provider
 }
 
 // Options configures the Engine at creation time.
@@ -101,6 +103,12 @@ func New(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("httpql: create admin API: %w", err)
 	}
 
+	// ── Secrets provider ──────────────────────────────────────────────────
+	secretProvider, err := secrets.New(cfg.Security.Secrets)
+	if err != nil {
+		return nil, fmt.Errorf("httpql: initialize secrets provider: %w", err)
+	}
+
 	// ── Emit engine.started audit event ──────────────────────────────────
 	digest, _ := config.Digest(cfg)
 	logger.Log(audit.Event{
@@ -113,13 +121,14 @@ func New(opts Options) (*Engine, error) {
 	})
 
 	return &Engine{
-		cfg:       cfg,
-		resolver:  resolver,
-		semaPool:  semaPool,
-		reqCache:  reqCache,
-		respCache: respCache,
-		logger:    logger,
-		adminAPI:  adminAPI,
+		cfg:            cfg,
+		resolver:       resolver,
+		semaPool:       semaPool,
+		reqCache:       reqCache,
+		respCache:      respCache,
+		logger:         logger,
+		adminAPI:       adminAPI,
+		secretProvider: secretProvider,
 	}, nil
 }
 
@@ -169,4 +178,19 @@ func (e *Engine) RegisterAdminRoutes(mux *http.ServeMux) {
 // Config returns the active configuration (read-only copy).
 func (e *Engine) Config() config.Config {
 	return e.cfg
+}
+
+// LookupSecret resolves the named secret using the configured secrets backend.
+//
+// The key format depends on the active backend:
+//
+//   - env     — environment-variable name (e.g. "MY_API_KEY")
+//   - vault   — "{secret-path}/{field}" (e.g. "services/myapp/api_key")
+//   - k8s     — "{secret-name}/{data-key}" (e.g. "myapp-secrets/api-key")
+//   - aws-ssm — parameter name; the configured prefix is prepended automatically
+//
+// Secret values are never written to logs regardless of the backend.
+// Returns [secrets.ErrNotFound] (wrapped) when the key does not exist.
+func (e *Engine) LookupSecret(ctx context.Context, key string) (string, error) {
+	return e.secretProvider.Lookup(ctx, key)
 }
